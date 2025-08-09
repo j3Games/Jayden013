@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1.0" />
+<title>Blauwe Vlieg Avontuur — Upgraded</title>
+<style>
+  :root {
+    --ui: #ffffff;
+  }
+  html, body {
+    margin: 0; padding: 0; height: 100%; background:#111; color: var(--ui);
+    font-family: system-ui, Arial, sans-serif;
+  }
+  canvas { display:block; width:100vw; height:100vh; background: linear-gradient(#78c6ff, #ff6a00); }
+  .hud {
+    position: fixed; left: 12px; top: 10px; z-index: 5; pointer-events: none;
+    text-shadow: 0 2px 4px rgba(0,0,0,.5);
+  }
+  .hud .line { font-weight: 700; margin: 4px 0; }
+  .btns {
+    position: fixed; right: 12px; bottom: 12px; z-index: 6; display:flex; gap:12px;
+  }
+  .btn {
+    background: rgba(0,0,0,.4); color:#fff; border:2px solid rgba(255,255,255,.7);
+    border-radius: 10px; padding: 12px 16px; font-weight: 800; font-size: 18px;
+    user-select: none; touch-action: manipulation;
+  }
+  .btn:active { transform: scale(0.98); }
+  .toast {
+    position: fixed; left: 50%; transform: translateX(-50%);
+    bottom: 24px; background: rgba(0,0,0,.6); border:1px solid rgba(255,255,255,.5);
+    padding:10px 14px; border-radius: 8px; font-size:14px; z-index:7; display:none;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div class="hud" id="hud">
+  <div class="line" id="lives">Levens: 3</div>
+  <div class="line" id="dist">Afstand: 0 m</div>
+  <div class="line" id="hint">Besturing: Spatie / ↑ of de SPRING-knop • P = pauze</div>
+</div>
+
+<div class="btns">
+  <button class="btn" id="jumpBtn" aria-label="Spring">SPRING</button>
+  <button class="btn" id="pauseBtn" aria-label="Pauze">Pauze</button>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+/* ============ Optioneel: eigen plaatjes invullen (urls) ============ */
+const useSprites = false; // zet op true als je hieronder urls invult
+const spriteURLs = {
+  fly: "",       // bijv. "https://example.com/blue-fly.png"
+  ape: "",       // bijv. "https://example.com/gorilla.png"
+  princess: "",  // bijv. "https://example.com/princess.png"
+  chest: "",     // bijv. "https://example.com/chest.png"
+  lava: ""       // bijv. "https://example.com/lava-texture.png"
+};
+/* ==================================================================== */
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d", { alpha: false });
+
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* --------- Audio (eenvoudige biepjes) --------- */
+let audioCtx = null;
+function ensureAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function beep(freq=600, dur=0.08, type="square", gain=0.03) {
+  if (!audioCtx) return;
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type = type; o.frequency.value = freq;
+  g.gain.value = gain;
+  o.connect(g).connect(audioCtx.destination);
+  o.start();
+  o.stop(audioCtx.currentTime + dur);
+}
+
+/* --------- Game state --------- */
+const G = {
+  gravity: 0.9,
+  jumpV: 17,
+  lavaH: 120,            // lavahoogte in pixels
+  baseSpeed: 5,
+  speed: 5,
+  distance: 0,
+  goal: 4000,           // 4000 meter = eind
+  lives: 3,
+  paused: false,
+  gameOver: false,
+  win: false,
+  t: 0
+};
+
+const cam = { x: 0 };
+const worldH = () => canvas.height;
+
+/* Entiteiten */
+const fly = { x: 100, y: 0, w: 48, h: 30, vy: 0, onGround: false, alive: true };
+fly.y = worldH() - G.lavaH - 150;
+
+const apes = [];
+const platforms = [];
+
+const princess = { x: G.goal + 120, y: 0, r: 36 };
+const chest = { x: G.goal + 200, y: 0, s: 40 };
+
+/* Platform generatie (eilanden) */
+function genPlatforms() {
+  platforms.length = 0;
+  const groundY = worldH() - G.lavaH - 30;
+  let x = 400;
+  while (x < G.goal + 600) {
+    const w = 160 + Math.random()*140;
+    const gap = 120 + Math.random()*220;
+    const y = groundY - (Math.random() < 0.65 ? 0 : (40 + Math.random()*100));
+    platforms.push({ x, y, w, h: 16 });
+    x += w + gap;
+  }
+  princess.y = platforms[platforms.length-2].y - 20;
+  chest.y = platforms[platforms.length-2].y + 10;
+}
+genPlatforms();
+
+/* Apen spawnen achter je */
+function spawnApe() {
+  const y = worldH() - G.lavaH - 50;
+  apes.push({ x: cam.x - 200 - Math.random()*200, y, r: 28, speed: 3 + Math.random()*2 });
+}
+for (let i=0;i<2;i++) spawnApe();
+
+/* --------- Input --------- */
+function jump() {
+  if (G.paused || G.gameOver || G.win) return;
+  if (fly.onGround) {
+    ensureAudio(); beep(720, 0.07, "square", 0.02);
+    fly.vy = -G.jumpV;
+    fly.onGround = false;
+  }
+}
+window.addEventListener("keydown", (e)=>{
+  if (e.code === "Space" || e.code === "ArrowUp") { e.preventDefault(); jump(); }
+  if (e.key.toLowerCase() === "p") togglePause();
+});
+document.getElementById("jumpBtn").addEventListener("pointerdown", (e)=>{ e.preventDefault(); ensureAudio(); jump(); });
+document.getElementById("pauseBtn").addEventListener("click", togglePause);
+canvas.addEventListener("pointerdown", ()=>{ ensureAudio(); }); // ontketen audio-context
+
+function togglePause() {
+  if (G.gameOver || G.win) return;
+  G.paused = !G.paused;
+  showToast(G.paused ? "Gepauzeerd (druk P of Pauze)" : "Doorgaan!");
+}
+
+/* --------- Hulpfuncties --------- */
+function rectsOverlap(a,b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+function circleRectOverlap(cx, cy, r, rx, ry, rw, rh) {
+  const testX = Math.max(rx, Math.min(cx, rx + rw));
+  const testY = Math.max(ry, Math.min(cy, ry + rh));
+  const dx = cx - testX, dy = cy - testY;
+  return (dx*dx + dy*dy) <= r*r;
+}
+function showToast(msg, ms=1200) {
+  const t = document.getElementById("toast");
+  t.textContent = msg; t.style.display = "block";
+  clearTimeout(showToast.timer);
+  showToast.timer = setTimeout(()=> t.style.display="none", ms);
+}
+
+/* --------- Sprites laden (optioneel) --------- */
+const sprites = {};
+if (useSprites) {
+  for (const k in spriteURLs) {
+    if (spriteURLs[k]) {
+      const img = new Image(); img.src = spriteURLs[k]; sprites[k] = img;
+    }
+  }
+}
+
+/* --------- Update --------- */
+function update(dt) {
+  if (G.paused || G.gameOver || G.win) return;
+  G.t += dt;
+  // Snelheid & moeilijkheid schalen
+  G.speed = G.baseSpeed + Math.min(6, G.t/6000); // langzaam sneller
+  if (apes.length < 4 && G.t > 8000) spawnApe();
+  if (apes.length < 6 && G.t > 16000) spawnApe();
+
+  // Zwaartekracht
+  fly.vy += G.gravity;
+  fly.y += fly.vy;
+
+  // Botsing met platforms (alleen van boven)
+  fly.onGround = false;
+  const flyBox = { x: fly.x, y: fly.y, w: fly.w, h: fly.h };
+  for (const p of platforms) {
+    const pb = { x: p.x, y: p.y, w: p.w, h: p.h };
+    if (rectsOverlap(flyBox, pb) && fly.vy >= 0 && fly.y + fly.h <= p.y + 20) {
+      fly.y = p.y - fly.h;
+      fly.vy = 0; fly.onGround = true;
+    }
+  }
+
+  // Lava grens
+  const lavaY = worldH() - G.lavaH;
+  if (fly.y + fly.h > lavaY) {
+    loseLife("Au! Lava is heet!");
+  }
+
+  // Camera & afstand
+  cam.x += G.speed;
+  G.distance = Math.floor(cam.x / 2); // schaal naar "meters" gevoel
+
+  // Apen bewegen en checken
+  for (const a of apes) {
+    const targetX = fly.x + cam.x - 200;
+    if (a.x < targetX) a.x += a.speed + G.speed*0.5;
+    else a.x -= 0.2;
+    a.y = worldH() - G.lavaH - 50;
+
+    if (circleRectOverlap(a.x, a.y, a.r, fly.x, fly.y, fly.w, fly.h)) {
+      loseLife("Een aap heeft je te pakken!");
+      break;
+    }
+  }
+
+  // Win-conditie
+  if (cam.x >= G.goal) {
+    G.win = true;
+    ensureAudio(); beep(880, 0.12, "triangle", 0.03); setTimeout(()=>beep(660, 0.12,"triangle",0.03), 130);
+    showToast("GEWONNEN! Je bereikte de prinses en de gouden kist!", 2500);
+  }
+}
+
+function loseLife(msg) {
+  if (!fly.alive) return;
+  ensureAudio(); beep(220, 0.12, "sawtooth", 0.04);
+  G.lives--;
+  document.getElementById("lives").textContent = "Levens: " + G.lives;
+  showToast(msg);
+  if (G.lives <= 0) {
+    G.gameOver = true;
+    setTimeout(()=> showToast("GAME OVER — druk F5 om opnieuw te proberen", 3000), 400);
+  } else {
+    // reset positie op laatst veilige platform (of start)
+    const safePlat = platforms.find(p => p.x + p.w > cam.x - 200) || platforms[0];
+    fly.x = 100;
+    fly.y = (safePlat ? safePlat.y - fly.h : worldH() - G.lavaH - 150);
+    fly.vy = 0; fly.onGround = true;
+  }
+}
+
+/* --------- Teken --------- */
+function draw() {
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  const lavaY = worldH() - G.lavaH;
+
+  // Achtergrond (simple parallax)
+  ctx.save();
+  ctx.globalAlpha = 0.15;
+  ctx.fillStyle = "#ffffff";
+  for (let i=0;i<20;i++) {
+    const x = (i*300 - (cam.x*0.2)%300);
+    ctx.fillRect(x, 60 + (i%5)*20, 60, 8);
+  }
+  ctx.restore();
+
+  // Lava
+  if (useSprites && sprites.lava && sprites.lava.complete) {
+    const pat = ctx.createPattern(sprites.lava, "repeat");
+    ctx.fillStyle = pat;
+  } else {
+    const grad = ctx.createLinearGradient(0, lavaY, 0, lavaY+G.lavaH);
+    grad.addColorStop(0, "#ff2d00");
+    grad.addColorStop(1, "#7a0000");
+    ctx.fillStyle = grad;
+  }
+  ctx.fillRect(0, lavaY, canvas.width, G.lavaH);
+  // Lava glans
+  ctx.globalAlpha = 0.25;
+  ctx.fillStyle = "#fff";
+  for (let i=0;i<6;i++){
+    const w = 160, h=8, x = (i*220 - (cam.x*0.6)%220);
+    ctx.fillRect(x, lavaY+18+(i%3)*12, w, h);
+  }
+  ctx.globalAlpha = 1;
+
+  // Platforms
+  ctx.fillStyle = "#3b2b16";
+  ctx.strokeStyle = "rgba(0,0,0,.4)";
+  for (const p of platforms) {
+    const sx = p.x - cam.x;
+    if (sx > canvas.width || sx + p.w < 0) continue;
+    ctx.fillRect(sx, p.y, p.w, p.h);
+    ctx.strokeRect(sx, p.y, p.w, p.h);
+  }
+
+  // Prinses & kist
+  const prx = princess.x - cam.x, chx = chest.x - cam.x;
+  if (useSprites && sprites.princess?.complete) {
+    const img = sprites.princess;
+    ctx.drawImage(img, prx - princess.r, princess.y - princess.r, princess.r*2, princess.r*2);
+  } else {
+    ctx.fillStyle = "pink";
+    ctx.beginPath(); ctx.arc(prx, princess.y, princess.r, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = "#fff"; ctx.fillRect(prx-6, princess.y-28, 12, 18); // kroontje vibe
+  }
+  if (useSprites && sprites.chest?.complete) {
+    ctx.drawImage(sprites.chest, chx, chest.y - chest.s, chest.s, chest.s);
+  } else {
+    ctx.fillStyle = "gold";
+    ctx.fillRect(chx, chest.y - chest.s, chest.s, chest.s);
+    ctx.strokeStyle = "#8b6b00"; ctx.strokeRect(chx, chest.y - chest.s, chest.s, chest.s);
+  }
+
+  // Apen
+  for (const a of apes) {
+    const ax = a.x - cam.x;
+    if (useSprites && sprites.ape?.complete) {
+      const r = a.r*2;
+      ctx.drawImage(sprites.ape, ax - a.r, a.y - a.r, r, r);
+    } else {
+      ctx.fillStyle = "saddlebrown";
+      ctx.beginPath(); ctx.arc(ax, a.y, a.r, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = "#000"; ctx.fillRect(ax-8, a.y-4, 16, 8);
+    }
+  }
+
+  // Vlieg (jij)
+  const fx = fly.x;
+  if (useSprites && sprites.fly?.complete) {
+    ctx.drawImage(sprites.fly, fx, fly.y, fly.w, fly.h);
+  } else {
+    ctx.fillStyle = "deepskyblue";
+    ctx.beginPath(); ctx.ellipse(fx+fly.w/2, fly.y+fly.h/2, fly.w/2, fly.h/2.5, 0, 0, Math.PI*2); ctx.fill();
+    // vleugels
+    ctx.globalAlpha = 0.6;
+    ctx.fillStyle = "#bfefff";
+    ctx.beginPath(); ctx.ellipse(fx+fly.w*0.3, fly.y+fly.h*0.2, 12, 8, -0.6, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(fx+fly.w*0.7, fly.y+fly.h*0.2, 12, 8, 0.6, 0, Math.PI*2); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  // HUD
+  document.getElementById("lives").textContent = "Levens: " + G.lives;
+  document.getElementById("dist").textContent = "Afstand: " + Math.min(G.goal, G.distance) + " m";
+
+  // Overlay teksten
+  if (G.paused || G.gameOver || G.win) {
+    ctx.fillStyle = "rgba(0,0,0,.45)";
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 42px system-ui, Arial";
+    ctx.textAlign = "center";
+    let msg = G.paused ? "Pauze" : (G.gameOver ? "GAME OVER" : "GEWONNEN!");
+    ctx.fillText(msg, canvas.width/2, canvas.height/2 - 12);
+    ctx.font = "20px system-ui, Arial";
+    ctx.fillText(G.gameOver ? "Druk F5 om opnieuw te beginnen" : "Druk P om door te gaan", canvas.width/2, canvas.height/2 + 22);
+  }
+}
+
+/* --------- Loop --------- */
+let last = 0;
+function loop(ts) {
+  const dt = Math.min(32, ts - last); last = ts;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+</script>
+</body>
+</html>
